@@ -2,27 +2,30 @@
   <img src="./img.png" alt="Project Banner" width="100%">
 </p>
 
-# [Project Name] 🎯
+# Forms Helper
 
 ## Basic Details
 
-### Team Name: [Name]
+### Team Name: KACHRA
 
 ### Team Members
-- Member 1: [Name] - [College]
-- Member 2: [Name] - [College]
+- Member 1: Sreedevi S - Christ College of Engineering
+- Member 2: Ishitha K - Christ College of Engineering
 
 ### Hosted Project Link
-[mention your project hosted link here]
+git@github.com:sreedevicodes/FormHelper.git
 
 ### Project Description
-[2-3 lines about what your project does]
+Form Helper is a browser extension that assists users while filling out web forms.  
+It scans forms on any webpage, walks through each empty or incomplete field, and provides inline help and smart suggested values so users can complete forms faster and with fewer errors.
 
 ### The Problem statement
-[What problem are you solving?]
+Many users find long or complex forms confusing and time‑consuming.  
+They are often unsure what is expected in each field, leading to mistakes, rejections, or simply abandoning the form.
 
 ### The Solution
-[How are you solving it?]
+The Form Helper extension automatically detects forms and applies a guided, field‑by‑field flow (as designed in the workflow diagram).  
+For each field, it checks whether the value is empty or invalid, shows helpful guidance, and optionally proposes a suggested value that the user can accept or ignore before moving on to the next field.
 
 ---
 
@@ -55,17 +58,27 @@ List the key features of your project:
 
 ## Implementation
 
-### For Software:
+### For Software (Browser Extension):
 
-#### Installation
-```bash
-[Installation commands - e.g., npm install, pip install -r requirements.txt]
-```
+#### Installation (Development)
+1. Clone or download this repository to your machine.
+2. **Configure Gemini API (Optional but Recommended):**
+   - Get your free Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
+   - Open `config.js` in the FormHelper folder
+   - Paste your API key: `GEMINI_API_KEY: "YOUR_API_KEY_HERE"`
+   - The extension will use AI-powered suggestions. Without an API key, it falls back to rule-based suggestions.
+3. Open your browser (Chrome/Edge/Brave) and go to `chrome://extensions/`.
+4. Enable **Developer mode**.
+5. Click **Load unpacked** and select the `FormHelper` folder containing `manifest.json`.
 
-#### Run
-```bash
-[Run commands - e.g., npm start, python app.py]
-```
+#### Usage
+1. Visit any website that contains a form.
+2. Once the page loads, the **Form Helper** overlay appears in the bottom‑right corner if form fields are detected.
+3. The helper highlights one field at a time:
+   - **Use suggestion**: fills the field with a context‑aware suggested value (e.g., sample email, phone, name).
+   - **Fill myself**: skips the suggestion and lets the user type manually.
+   - **Ignore**: skips the field without changes.
+4. After all empty/incomplete fields are processed, the overlay shows a completion message so the user can review and submit the form.
 
 ### For Hardware:
 

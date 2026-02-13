@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Form Helper",
+  "version": "0.1.0",
+  "description": "Browser extension that helps users fill out web forms by providing guidance and smart suggestions field-by-field.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "config.js",
+        "contentScript.js"
+      ],
+      "css": [
+        "formHelper.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

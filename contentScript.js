@@ -9,6 +9,8 @@
   let currentSuggestion = null; // Track the current suggestion shown to the user
   let suggestionCache = {}; // Cache for AI suggestions
   let pendingSuggestions = new Map(); // Track pending API calls
+  let apiBackoffUntil = 0; // Timestamp until which API is disabled due to 429
+
 
   function loadProfile(callback) {
     if (!("chrome" in window) || !chrome.storage) {
@@ -96,12 +98,12 @@
 
     const history = loadOverrideHistory();
     history.push(overrideRecord);
-    
+
     // Keep only last 1000 overrides to prevent localStorage bloat
     if (history.length > 1000) {
       history.splice(0, history.length - 1000);
     }
-    
+
     saveOverrideHistory(history);
   }
 
@@ -121,14 +123,42 @@
   async function getGeminiSuggestion(field) {
     if (!field) return null;
 
-    // Check cache first
+    // Check cache first (memory + local storage)
     const cacheKey = getCacheKeyForField(field);
+
+    // Memory cache
     if (cacheKey && suggestionCache[cacheKey]) {
       return suggestionCache[cacheKey];
     }
 
+    // Local Storage cache (persist across reloads)
+    try {
+      const storedCache = localStorage.getItem("fh_suggestion_cache");
+      if (storedCache) {
+        const parsed = JSON.parse(storedCache);
+        if (parsed[cacheKey]) {
+          suggestionCache[cacheKey] = parsed[cacheKey]; // Hydrate memory cache
+          return parsed[cacheKey];
+        }
+      }
+    } catch (e) {
+      console.warn("Form Helper: Failed to read local cache", e);
+    }
+
+    // Check if we are in a backoff period
+    if (Date.now() < apiBackoffUntil) {
+      console.warn("Form Helper: API is cooling down due to rate limits.");
+      return null; // Force fallback to local logic
+    }
+
     // Check if API is configured
     if (!FORM_HELPER_CONFIG || !FORM_HELPER_CONFIG.GEMINI_API_KEY || !FORM_HELPER_CONFIG.USE_AI_SUGGESTIONS) {
+      return null;
+    }
+
+    // Check chrome runtime context before proceeding
+    if (!chrome.runtime?.id) {
+      console.warn("Form Helper: Extension context invalidated.");
       return null;
     }
 
@@ -146,15 +176,15 @@
     const isRequired = field.hasAttribute("required");
     const pageTitle = document.title;
     const pageUrl = window.location.href;
-    
+
     // Get user profile context
-    const profileContext = Object.keys(userProfile).length > 0 
+    const profileContext = Object.keys(userProfile).length > 0
       ? `User's previously stored information: ${JSON.stringify(userProfile)}`
       : "";
 
     // Get override history context
     const overrideHistory = getOverrideHistory();
-    const recentOverrides = overrideHistory.slice(-5).map(ov => 
+    const recentOverrides = overrideHistory.slice(-5).map(ov =>
       `Field "${ov.fieldLabel}": User overrode suggestion "${ov.suggestedValue}" with "${ov.userValue || 'skipped'}"`
     ).join("; ");
     const overrideContext = recentOverrides ? `Recent user preferences: ${recentOverrides}` : "";
@@ -189,70 +219,76 @@ Example value:`;
 
     try {
       const apiKey = FORM_HELPER_CONFIG.GEMINI_API_KEY;
-      const apiUrl = `${FORM_HELPER_CONFIG.GEMINI_API_URL}?key=${apiKey}`;
+      const apiUrl = FORM_HELPER_CONFIG.GEMINI_API_URL.replace(/\?.*$/, ""); // base URL without key
 
-      const requestBody = {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
-        }]
-      };
-
-      // Create a promise for this request
-      const suggestionPromise = fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(requestBody)
-      })
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+      const suggestionPromise = new Promise((resolve, reject) => {
+        if (!chrome.runtime?.id) {
+          return reject(new Error("Extension context invalidated"));
         }
-        return response.json();
+        chrome.runtime.sendMessage({
+          type: "GEMINI_SUGGESTION",
+          apiUrl,
+          apiKey,
+          prompt
+        }, (response) => {
+          if (chrome.runtime.lastError) {
+            return reject(chrome.runtime.lastError);
+          }
+          resolve(response);
+        });
       })
-      .then(data => {
-        if (data.candidates && data.candidates[0] && data.candidates[0].content) {
-          const text = data.candidates[0].content.parts[0].text.trim();
-          // Remove quotes if present
-          const cleanText = text.replace(/^["']|["']$/g, "").trim();
-          
-          // Check if it's "null" or empty
-          if (cleanText.toLowerCase() === "null" || !cleanText) {
+        .then((res) => {
+          if (res.error) {
+            console.warn("Form Helper Gemini API:", res.error);
+            // Check for Rate Limit (429)
+            if (String(res.error).includes("429")) {
+              console.warn("Form Helper: Rate limit hit. Backing off for 60 seconds.");
+              apiBackoffUntil = Date.now() + 60000; // 60s cooldown
+            }
             return null;
           }
-          
-          // Cache the result
+          const cleanText = (res.value || "").trim();
+          if (!cleanText || cleanText.toLowerCase() === "null") return null;
+
           if (cacheKey && FORM_HELPER_CONFIG.CACHE_SUGGESTIONS) {
+            // Update memory cache
             suggestionCache[cacheKey] = cleanText;
-            // Limit cache size
             const keys = Object.keys(suggestionCache);
             if (keys.length > FORM_HELPER_CONFIG.MAX_CACHE_SIZE) {
               delete suggestionCache[keys[0]];
             }
-          }
-          
-          return cleanText;
-        }
-        return null;
-      })
-      .catch(error => {
-        console.warn("Gemini API error:", error);
-        return null;
-      })
-      .finally(() => {
-        // Remove from pending requests
-        pendingSuggestions.delete(cacheKey);
-      });
 
-      // Store promise in pending map
+            // Update local storage cache
+            try {
+              const stored = localStorage.getItem("fh_suggestion_cache");
+              const parsed = stored ? JSON.parse(stored) : {};
+              parsed[cacheKey] = cleanText;
+
+              // Keep local storage from growing indefinitely (simple strategy)
+              const storedKeys = Object.keys(parsed);
+              if (storedKeys.length > 500) {
+                // remove oldest 100 roughly (keys order not guaranteed but okay for simple cache)
+                for (let i = 0; i < 100; i++) delete parsed[storedKeys[i]];
+              }
+              localStorage.setItem("fh_suggestion_cache", JSON.stringify(parsed));
+            } catch (e) {
+              console.warn("Failed to write to local cache", e);
+            }
+          }
+          return cleanText;
+        })
+        .catch((err) => {
+          console.warn("Form Helper Gemini API Error:", err?.message || err);
+          return null;
+        })
+        .finally(() => {
+          pendingSuggestions.delete(cacheKey);
+        });
+
       pendingSuggestions.set(cacheKey, suggestionPromise);
-      
       return suggestionPromise;
     } catch (error) {
-      console.warn("Failed to call Gemini API:", error);
+      console.warn("Form Helper Gemini API Critical Error:", error);
       pendingSuggestions.delete(cacheKey);
       return null;
     }
@@ -300,7 +336,7 @@ Example value:`;
 
   function getFallbackSuggestion(el) {
     if (!el) return null;
-    
+
     const type = (el.getAttribute("type") || "").toLowerCase();
     const name = (el.getAttribute("name") || el.getAttribute("id") || "").toLowerCase();
     const label = getFieldLabel(el).toLowerCase();
@@ -354,7 +390,7 @@ Example value:`;
     if (/^age/i.test(name) || /^age$/i.test(label)) {
       return "25";
     }
-    
+
     // Fallback: check if label contains common patterns (less specific)
     if (/email/i.test(label) && !/username/i.test(label)) {
       return "user@example.com";
@@ -369,21 +405,8 @@ Example value:`;
     return null;
   }
 
-  function init() {
-    if (flowActive) return;
-    const allForms = Array.from(document.forms || []);
-    fields = allForms.flatMap(form =>
-      Array.from(form.querySelectorAll("input, textarea, select")).filter(isFieldRelevant)
-    );
-    if (!fields.length) return;
-    
-    // Load profile first, then start the form filling process
-    loadProfile(() => {
-      flowActive = true;
-      buildOverlay();
-      goToNextField();
-    });
-  }
+  // Init function is now at the end of the file
+
 
   function isFieldRelevant(el) {
     if (!(el instanceof HTMLElement)) return false;
@@ -443,7 +466,7 @@ Example value:`;
 
   async function getSuggestedValue(el) {
     if (!el) return null;
-    
+
     // First check user profile (most accurate)
     const profileKey = getProfileKeyForField(el);
     if (profileKey && userProfile[profileKey]) {
@@ -488,7 +511,15 @@ Example value:`;
       </div>
     `;
 
-    document.documentElement.appendChild(overlayEl);
+    document.body.appendChild(overlayEl);
+
+    // Ensure logic handles removed overlay gracefully
+    if (!document.body.contains(overlayEl)) {
+      // Fallback if append failed for some reason
+      try {
+        document.documentElement.appendChild(overlayEl);
+      } catch (e) { }
+    }
 
     overlayEl.querySelector(".fh-close").addEventListener("click", () => {
       teardown();
@@ -503,19 +534,19 @@ Example value:`;
     useBtn.addEventListener("click", async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      
+
       if (!activeField) {
         console.warn("Form Helper: No active field");
         return;
       }
-      
+
       // Check if button is disabled
       const btn = overlayEl.querySelector(".fh-btn-use");
       if (btn && btn.disabled) {
         console.warn("Form Helper: Button is disabled");
         return;
       }
-      
+
       if (currentSuggestion != null && currentSuggestion !== "") {
         // Use the displayed suggestion value, not recalculate it
         setFieldValue(activeField, currentSuggestion);
@@ -524,7 +555,7 @@ Example value:`;
       } else {
         console.warn("Form Helper: No suggestion available");
       }
-      
+
       const usedSuggestion = currentSuggestion;
       currentSuggestion = null; // Clear suggestion tracking
       await goToNextField();
@@ -562,43 +593,82 @@ Example value:`;
     const label = getFieldLabel(field);
     const help = getHelpText(field);
 
+    // Clear any pending debounce
+    if (window.fh_debounceTimer) {
+      clearTimeout(window.fh_debounceTimer);
+    }
+
     // Update label and help immediately
     labelEl.textContent = label;
     helpEl.textContent = help;
 
-    // Show loading state if using AI
-    if (FORM_HELPER_CONFIG && FORM_HELPER_CONFIG.USE_AI_SUGGESTIONS && FORM_HELPER_CONFIG.GEMINI_API_KEY) {
-      suggestionBox.style.display = "block";
-      suggestionValueEl.textContent = "Generating suggestion...";
-      useBtn.disabled = true;
-      useBtn.style.pointerEvents = "none";
-      useBtn.style.cursor = "not-allowed";
-    } else {
-      // If not using AI, ensure button is enabled if we have a fallback suggestion
-      useBtn.disabled = false;
-      useBtn.style.pointerEvents = "auto";
-      useBtn.style.cursor = "pointer";
-    }
-
-    // Get suggestion (async)
-    const suggestion = await getSuggestedValue(field);
-
-    // Store current suggestion for override tracking
-    currentSuggestion = suggestion;
-
-    // Update UI with suggestion
-    if (suggestion != null && suggestion !== "") {
+    // Check if we have a cached value ready-to-go (synchronous check mostly)
+    // If we have it in memory cache, show immediately without debounce
+    const cacheKey = getCacheKeyForField(field);
+    if (cacheKey && suggestionCache[cacheKey]) {
+      const suggestion = suggestionCache[cacheKey];
+      currentSuggestion = suggestion;
       suggestionBox.style.display = "block";
       suggestionValueEl.textContent = suggestion;
       useBtn.disabled = false;
       useBtn.style.pointerEvents = "auto";
       useBtn.style.cursor = "pointer";
-    } else {
-      suggestionBox.style.display = "none";
-      suggestionValueEl.textContent = "";
+      return;
+    }
+
+    // Otherwise, delayed fetch
+    if (FORM_HELPER_CONFIG && FORM_HELPER_CONFIG.USE_AI_SUGGESTIONS && FORM_HELPER_CONFIG.GEMINI_API_KEY) {
+      suggestionBox.style.display = "block";
+      suggestionValueEl.textContent = "..."; // minimal indicator
       useBtn.disabled = true;
-      useBtn.style.pointerEvents = "none";
-      useBtn.style.cursor = "not-allowed";
+      useBtn.style.cursor = "wait";
+
+      window.fh_debounceTimer = setTimeout(async () => {
+        // Show actual loading state
+        suggestionValueEl.textContent = "Thinking...";
+
+        try {
+          const suggestion = await getSuggestedValue(field);
+
+          // Verify we are still on the same field before updating (simple check)
+          if (activeField !== field) return;
+
+          currentSuggestion = suggestion;
+          if (suggestion != null && suggestion !== "") {
+            suggestionBox.style.display = "block";
+            suggestionValueEl.textContent = suggestion;
+            useBtn.disabled = false;
+            useBtn.style.pointerEvents = "auto";
+            useBtn.style.cursor = "pointer";
+          } else {
+            suggestionBox.style.display = "none";
+            suggestionValueEl.textContent = "";
+            useBtn.disabled = true;
+            useBtn.style.pointerEvents = "none";
+            useBtn.style.cursor = "not-allowed";
+          }
+        } catch (e) {
+          console.warn("Form Helper: Suggestion failed", e);
+          suggestionValueEl.textContent = "Error";
+        }
+      }, 1000); // 1 second debounce
+    } else {
+      // Fallback logic (instant)
+      const suggestion = await getSuggestedValue(field);
+      currentSuggestion = suggestion;
+      if (suggestion != null && suggestion !== "") {
+        suggestionBox.style.display = "block";
+        suggestionValueEl.textContent = suggestion;
+        useBtn.disabled = false;
+        useBtn.style.pointerEvents = "auto";
+        useBtn.style.cursor = "pointer";
+      } else {
+        suggestionBox.style.display = "none";
+        suggestionValueEl.textContent = "";
+        useBtn.disabled = true;
+        useBtn.style.pointerEvents = "none";
+        useBtn.style.cursor = "not-allowed";
+      }
     }
   }
 
@@ -706,12 +776,214 @@ Example value:`;
   }
 
   // Expose override history function globally for API calls
+
+  // --- Chatbot Implementation ---
+
+  let chatWindowEl = null;
+  let chatMessagesEl = null;
+  let chatInputEl = null;
+
+  function buildChatUI() {
+    if (document.querySelector(".fh-chat-fab")) return;
+
+    // Floating Action Button
+    const fab = document.createElement("button");
+    fab.className = "fh-chat-fab";
+    fab.title = "Ask Form Helper";
+    fab.innerHTML = `<svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>`;
+    fab.addEventListener("click", toggleChatWindow);
+    document.body.appendChild(fab);
+
+    // Chat Window
+    chatWindowEl = document.createElement("div");
+    chatWindowEl.className = "fh-chat-window";
+    chatWindowEl.innerHTML = `
+      <div class="fh-chat-header">
+        <div class="fh-chat-title">
+          <svg viewBox="0 0 24 24" style="width:20px;height:20px;fill:currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>
+          Form Helper Chat
+        </div>
+        <button class="fh-chat-close" title="Close">&times;</button>
+      </div>
+      <div class="fh-chat-messages">
+        <div class="fh-chat-msg bot">
+          Hi! I can help you fill out this form. Ask me anything about the fields, or need help with file uploads?
+        </div>
+      </div>
+      <div class="fh-chat-input-area">
+        <input type="text" class="fh-chat-input" placeholder="Type your question..." />
+        <button class="fh-chat-send" disabled>
+          <svg viewBox="0 0 24 24" style="width:20px;height:20px;fill:currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+      </div>
+    `;
+    document.body.appendChild(chatWindowEl);
+
+    // Elements
+    chatMessagesEl = chatWindowEl.querySelector(".fh-chat-messages");
+    chatInputEl = chatWindowEl.querySelector(".fh-chat-input");
+    const sendBtn = chatWindowEl.querySelector(".fh-chat-send");
+    const closeBtn = chatWindowEl.querySelector(".fh-chat-close");
+
+    // Event Listeners
+    closeBtn.addEventListener("click", toggleChatWindow);
+
+    chatInputEl.addEventListener("input", () => {
+      sendBtn.disabled = !chatInputEl.value.trim();
+    });
+
+    chatInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    sendBtn.addEventListener("click", sendChatMessage);
+  }
+
+  function toggleChatWindow() {
+    if (!chatWindowEl) return;
+    chatWindowEl.classList.toggle("open");
+    if (chatWindowEl.classList.contains("open")) {
+      setTimeout(() => chatInputEl.focus(), 100);
+    }
+  }
+
+  function appendMessage(text, type) {
+    if (!chatMessagesEl) return;
+    const msgDiv = document.createElement("div");
+    msgDiv.className = `fh-chat-msg ${type}`;
+
+    // Simple markdown support
+    let html = text
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") // Escape HTML
+      .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>") // Bold
+      .replace(/`(.*?)`/g, "<code>$1</code>") // Code
+      .replace(/\\n/g, "<br>"); // Newlines
+
+    msgDiv.innerHTML = html;
+    chatMessagesEl.appendChild(msgDiv);
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    return msgDiv;
+  }
+
+  function showTyping() {
+    if (!chatMessagesEl) return null;
+    const typingDiv = document.createElement("div");
+    typingDiv.className = "fh-typing";
+    typingDiv.innerHTML = `<div class="fh-typing-dot"></div><div class="fh-typing-dot"></div><div class="fh-typing-dot"></div>`;
+    chatMessagesEl.appendChild(typingDiv);
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    return typingDiv;
+  }
+
+  async function sendChatMessage() {
+    const text = chatInputEl.value.trim();
+    if (!text) return;
+
+    chatInputEl.value = "";
+    chatWindowEl.querySelector(".fh-chat-send").disabled = true;
+    appendMessage(text, "user");
+
+    const typingIndicator = showTyping();
+
+    // Gather context
+    const context = {
+      pageTitle: document.title,
+      pageUrl: window.location.href,
+      activeField: activeField ? {
+        label: getFieldLabel(activeField),
+        name: activeField.name || activeField.id,
+        type: activeField.type,
+        placeholder: activeField.placeholder,
+        required: activeField.required,
+        value: activeField.value
+      } : null,
+      fileUploads: Array.from(document.querySelectorAll('input[type="file"]')).map(f => ({
+        label: getFieldLabel(f),
+        accept: f.accept,
+        multiple: f.multiple,
+        id: f.id
+      }))
+    };
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "GEMINI_CHAT",
+        prompt: text,
+        context: context,
+        apiKey: FORM_HELPER_CONFIG ? FORM_HELPER_CONFIG.GEMINI_API_KEY : null,
+        apiUrl: FORM_HELPER_CONFIG ? FORM_HELPER_CONFIG.GEMINI_API_URL : null
+      });
+
+      if (typingIndicator) typingIndicator.remove();
+
+      if (response && response.text) {
+        appendMessage(response.text, "bot");
+      } else if (response && response.error) {
+        appendMessage("Sorry, I encountered an error: " + response.error, "system");
+      } else {
+        appendMessage("Sorry, I couldn't get a response.", "system");
+      }
+    } catch (err) {
+      if (typingIndicator) typingIndicator.remove();
+      appendMessage("Error sending message: " + err.message, "system");
+    }
+  }
+
+  function init() {
+    if (flowActive) return;
+    const allForms = Array.from(document.forms || []);
+    fields = allForms.flatMap(form =>
+      Array.from(form.querySelectorAll("input, textarea, select")).filter(isFieldRelevant)
+    );
+
+    // Always build chat UI if configured
+    if (FORM_HELPER_CONFIG && FORM_HELPER_CONFIG.USE_AI_SUGGESTIONS) {
+      buildChatUI();
+    }
+
+    if (!fields.length) return;
+
+    // Load profile first, then start the form filling process
+    loadProfile(() => {
+      flowActive = true;
+      buildOverlay();
+      goToNextField();
+    });
+  }
+
+  // Expose override history function globally for API calls
   window.formHelperGetOverrideHistory = getOverrideHistory;
 
   if (document.readyState === "complete" || document.readyState === "interactive") {
+    // Inject CSS manually as fallback
+    function injectCSS() {
+      if (document.getElementById("fh-styles-injected")) return;
+      const link = document.createElement("link");
+      link.id = "fh-styles-injected";
+      link.rel = "stylesheet";
+      link.href = chrome.runtime.getURL("formHelper.css");
+      (document.head || document.documentElement).appendChild(link);
+    }
+
+    injectCSS();
     init();
   } else {
-    window.addEventListener("DOMContentLoaded", init, { once: true });
+    window.addEventListener("DOMContentLoaded", () => {
+      // Inject CSS manually as fallback
+      function injectCSS() {
+        if (document.getElementById("fh-styles-injected")) return;
+        const link = document.createElement("link");
+        link.id = "fh-styles-injected";
+        link.rel = "stylesheet";
+        link.href = chrome.runtime.getURL("formHelper.css");
+        (document.head || document.documentElement).appendChild(link);
+      }
+      injectCSS();
+      init();
+    }, { once: true });
   }
 })();
 
